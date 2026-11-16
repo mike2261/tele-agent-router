@@ -54,12 +54,19 @@ const ANIMALS = [
   ["Hổ", "🐯"], ["Rồng", "🐉"], ["Bạch Tuộc", "🐙"], ["Mèo", "🐱"], ["Khỉ", "🐒"],
   ["Cá Mập", "🦈"], ["Đại Bàng", "🦅"], ["Rùa", "🐢"], ["Ong", "🐝"], ["Voi", "🐘"],
 ];
-function pickAnimal() {
-  const used = new Set(Object.values(db.topics).map((t) => t.name));
-  const free = ANIMALS.filter(([n]) => !used.has(n));
+// Tên topic = tên folder đang làm việc; emoji con vật chỉ để dễ phân biệt.
+// Trùng tên folder với topic khác → thêm số: "robo-worker 2".
+function pickName(cwd) {
+  const base = cwd === os.homedir() ? "home" : path.basename(cwd) || cwd;
+  const topics = Object.values(db.topics);
+  const usedNames = new Set(topics.map((t) => t.name));
+  let name = base;
+  for (let i = 2; usedNames.has(name); i++) name = `${base} ${i}`;
+  const usedEmoji = new Set(topics.map((t) => t.emoji));
+  const free = ANIMALS.filter(([, e]) => !usedEmoji.has(e));
   const pool = free.length ? free : ANIMALS;
-  const [name, emoji] = pool[Math.floor(Math.random() * pool.length)];
-  return { name: free.length ? name : `${name} ${Object.keys(db.topics).length + 1}`, emoji };
+  const [, emoji] = pool[Math.floor(Math.random() * pool.length)];
+  return { name, emoji };
 }
 const slug = (s) =>
   s.normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/đ/gi, "d")
@@ -156,12 +163,16 @@ async function runClaude(topic, prompt) {
   if (MODEL) args.push("--model", MODEL);
   // Claude CLI bỏ qua allow-list của project chưa "trust" ở chế độ -p, nên truyền allow-list
   // từ TEMPLATE_DIR (file của chính mình, không phải của repo lạ) qua cờ --allowedTools.
-  if (TEMPLATE_ALLOW.length) args.push("--allowedTools", ...TEMPLATE_ALLOW);
+  const allow = [...TEMPLATE_ALLOW];
+  // /chrome on → bật Claude in Chrome cho topic này (dùng Chrome thật, có sẵn đăng nhập của bạn)
+  if (topic.chrome) { args.push("--chrome"); allow.push("mcp__claude-in-chrome"); }
+  if (allow.length) args.push("--allowedTools", ...allow);
 
   const t0 = Date.now();
   const status = await send(topic, `⏳ ${tag(topic)} đang làm...`);
   const child = spawn(CLAUDE_BIN, args, { cwd: topic.cwd, env, stdio: ["pipe", "pipe", "pipe"] });
   running.get(topic.threadId).child = child;
+  if (running.get(topic.threadId).stopped) child.kill("SIGINT"); // /exit lúc đang khởi động
   child.stdin.end(prompt); // prompt via stdin: safe for long text / leading dashes
 
   let buf = "", stderr = "", result = null, steps = 0, lastTool = "", lastEdit = 0;
@@ -234,7 +245,6 @@ bot.command("id", (ctx) =>
 
 bot.command("new", async (ctx) => {
   if (!ctx.chat.is_forum) return ctx.reply("Group cần bật Topics.");
-  const { name, emoji } = pickAnimal();
   // /new                  → làm việc ở thư mục home (~), giống mở terminal mới
   // /new work/robo-worker → ~/work/robo-worker (tương đối tính từ ~, như `cd` trong terminal)
   // /new /abs/path, ~/x   → đúng đường dẫn đó
@@ -246,7 +256,8 @@ bot.command("new", async (ctx) => {
   // Chỉ copy template vào thư mục MỚI tạo — không đụng vào repo có sẵn hay home
   if (!existed && fs.existsSync(TEMPLATE_DIR)) fs.cpSync(TEMPLATE_DIR, cwd, { recursive: true });
 
-  const ft = await ctx.api.createForumTopic(ctx.chat.id, `${name} ${emoji}`);
+  const { name, emoji } = pickName(cwd);
+  const ft = await ctx.api.createForumTopic(ctx.chat.id, `${emoji} ${name}`.slice(0, 128));
   const topic = {
     chatId: ctx.chat.id, threadId: ft.message_thread_id, name, emoji, cwd,
     sessionId: randomUUID(), started: false, createdAt: new Date().toISOString(),
@@ -266,6 +277,43 @@ bot.command("stop", async (ctx) => {
   setTimeout(() => r.child.exitCode === null && r.child.kill("SIGKILL"), 5000);
 });
 
+// /exit → dừng task, xoá session khỏi bot và xoá luôn topic (thư mục code giữ nguyên)
+bot.command("exit", async (ctx) => {
+  const id = ctx.message?.message_thread_id;
+  const topic = db.topics[id];
+  if (!topic) return ctx.reply("Gõ /exit trong topic muốn đóng.");
+  queues.delete(id);
+  const w = waiting.indexOf(id);
+  if (w >= 0) waiting.splice(w, 1);
+  const r = running.get(id);
+  if (r) r.stopped = true;
+  if (r?.child) {
+    r.child.kill("SIGINT");
+    setTimeout(() => r.child.exitCode === null && r.child.kill("SIGKILL"), 5000);
+  }
+  delete db.topics[id];
+  save();
+  try {
+    await bot.api.deleteForumTopic(topic.chatId, topic.threadId);
+  } catch (e) {
+    // Thiếu quyền "Delete messages" → ít nhất đóng topic lại
+    await bot.api.closeForumTopic(topic.chatId, topic.threadId).catch(() => {});
+    await send(topic, `🗑 Đã xoá session ${tag(topic)}, nhưng không xoá được topic (${e.description || e.message}). ` +
+      "Cấp cho bot quyền Delete Messages, hoặc xoá topic bằng tay.");
+  }
+});
+
+bot.command("chrome", async (ctx) => {
+  const topic = db.topics[ctx.message?.message_thread_id];
+  if (!topic) return ctx.reply("Gõ /chrome trong một topic.");
+  const arg = ctx.match?.trim().toLowerCase();
+  topic.chrome = arg === "on" ? true : arg === "off" ? false : !topic.chrome;
+  save();
+  await send(topic, topic.chrome
+    ? "🌐 Đã bật Chrome cho topic này. Claude điều khiển được Chrome thật trên Mac (kèm đăng nhập của bạn). /chrome off để tắt."
+    : "Đã tắt Chrome cho topic này.");
+});
+
 bot.command("reset", async (ctx) => {
   const topic = db.topics[ctx.message?.message_thread_id];
   if (!topic) return;
@@ -278,7 +326,7 @@ bot.command("reset", async (ctx) => {
 bot.command("status", async (ctx) => {
   const lines = Object.values(db.topics).map((t) => {
     const s = running.has(t.threadId) ? "🟢 chạy" : queues.get(t.threadId)?.length ? "🟡 chờ" : "⚪️ rảnh";
-    return `${s}  ${t.emoji} ${t.name}  📁 ${path.basename(t.cwd)}`;
+    return `${s}  ${t.emoji} ${t.name}  📁 ${t.cwd.replace(os.homedir(), "~")}`;
   });
   await ctx.reply(lines.join("\n") || "Chưa có session nào. Gõ /new để tạo.", {
     message_thread_id: ctx.message?.message_thread_id,
@@ -336,6 +384,8 @@ await bot.api.setMyCommands([
   { command: "stop", description: "Dừng task trong topic này" },
   { command: "reset", description: "Xoá context, giữ thư mục" },
   { command: "usage", description: "Xem quota gói Claude" },
+  { command: "chrome", description: "Bật/tắt Claude in Chrome cho topic này" },
+  { command: "exit", description: "Đóng session và xoá topic này" },
   { command: "context", description: "Xem context của session này" },
   { command: "compact", description: "Nén context của session này" },
   { command: "id", description: "Xem chat_id / user_id" },

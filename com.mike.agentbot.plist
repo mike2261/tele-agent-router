@@ -13,6 +13,13 @@
     <string>cd "$HOME/tele-agent-router" &amp;&amp; exec node --env-file=.env index.mjs</string>
   </array>
 
+  <!-- launchd không nạp ~/.zshrc nên phải khai báo PATH (nvm node + claude) -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/mike/.local/bin:/Users/mike/.nvm/versions/node/v24.18.1/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>

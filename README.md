@@ -35,14 +35,17 @@ Group "Agent Team" (Topics)
 
 | Lệnh | Ở đâu | Làm gì |
 |---|---|---|
-| `/new` | General | Tạo topic + session mới, thư mục `~/agents/<tên-con-vật>` |
-| `/new tuni-web` | General | Tạo topic mới, làm việc trong `~/agents/tuni-web` |
+| `/new` | General | Tạo topic + session mới, làm việc ở `~` (home) |
+| `/new work/robo-worker` | General | Tạo topic mới, làm việc trong `~/work/robo-worker` (tương đối tính từ `~`, như `cd`). Thư mục mới tạo thì được copy template; thư mục có sẵn thì giữ nguyên |
 | (nhắn bình thường) | trong topic | Giao việc / chat với session đó |
 | `/stop` | trong topic | Dừng task đang chạy |
 | `/reset` | trong topic | Xoá context, giữ nguyên code |
 | `/status` | đâu cũng được | Xem session nào đang chạy / chờ / rảnh |
+| `!lệnh` | trong topic | Chạy shell trực tiếp trong thư mục của topic (không qua Claude, không tốn token, không bị allow-list chặn) |
+| `/usage` | đâu cũng được | Xem quota gói Claude |
+| `/context`, `/compact`, `/...` | trong topic | Chuyển thẳng cho Claude CLI của session đó |
 
-Mỗi task: bot gửi `⏳ đang làm...`, cứ ~4 giây cập nhật bước đang làm (tool nào, file nào), xong thì báo `✅` kèm thời gian và chi phí ước tính, rồi gửi câu trả lời.
+Mỗi task: bot gửi `⏳ đang làm...`, cứ ~4 giây cập nhật bước đang làm (tool nào, file nào), xong thì báo `✅` kèm thời gian và số token (in/out), rồi gửi câu trả lời.
 
 ## Ghi chú
 

@@ -27,8 +27,14 @@ const MAX_CONCURRENT = Number(env.MAX_CONCURRENT || 2);
 const DB_FILE = expand(env.DB_FILE || path.resolve("sessions.json"));
 const APPEND_PROMPT =
   env.APPEND_PROMPT ||
-  "Người dùng điều khiển bạn qua Telegram trên điện thoại. Trả lời ngắn gọn bằng tiếng Việt. " +
-    "Kết thúc mỗi lượt bằng: việc đã làm, kết quả (link/file/đường dẫn), và điều cần người dùng quyết định (nếu có).";
+  "Người dùng nhắn cho bạn qua Telegram, tin nhắn của họ được chuyển thẳng vào đây. " +
+    "Trả lời tự nhiên như đang làm việc trong terminal, dùng ngôn ngữ người dùng dùng. Không cần tóm tắt theo mẫu cố định.";
+
+let TEMPLATE_ALLOW = [];
+try {
+  TEMPLATE_ALLOW = JSON.parse(fs.readFileSync(path.join(TEMPLATE_DIR, ".claude/settings.json"), "utf8"))
+    .permissions?.allow ?? [];
+} catch {}
 
 if (!BOT_TOKEN) {
   console.error("Missing BOT_TOKEN in .env");
@@ -115,6 +121,22 @@ function pump() {
   }
 }
 
+const fmtTok = (n) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : String(n));
+
+// Run a shell command and collect output (used by `!cmd` and /usage)
+function runCapture(cmd, args, cwd, timeoutMs = 120000) {
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    const add = (c) => { out += c; if (out.length > 20000) out = out.slice(-20000); };
+    child.stdout.on("data", add);
+    child.stderr.on("data", add);
+    const timer = setTimeout(() => { out += `\n⏱ quá ${timeoutMs / 1000}s, đã dừng.`; child.kill("SIGKILL"); }, timeoutMs);
+    child.on("error", (e) => { clearTimeout(timer); resolve({ code: -1, out: e.message }); });
+    child.on("close", (code) => { clearTimeout(timer); resolve({ code, out }); });
+  });
+}
+
 function describeTool(b) {
   const i = b.input || {};
   const detail = i.command || i.file_path || i.path || i.pattern || i.url || i.description || "";
@@ -132,6 +154,9 @@ async function runClaude(topic, prompt) {
   if (topic.started) args.push("--resume", topic.sessionId);
   else args.push("--session-id", topic.sessionId);
   if (MODEL) args.push("--model", MODEL);
+  // Claude CLI bỏ qua allow-list của project chưa "trust" ở chế độ -p, nên truyền allow-list
+  // từ TEMPLATE_DIR (file của chính mình, không phải của repo lạ) qua cờ --allowedTools.
+  if (TEMPLATE_ALLOW.length) args.push("--allowedTools", ...TEMPLATE_ALLOW);
 
   const t0 = Date.now();
   const status = await send(topic, `⏳ ${tag(topic)} đang làm...`);
@@ -181,8 +206,10 @@ async function runClaude(topic, prompt) {
   if (result) {
     if (result.session_id) { topic.sessionId = result.session_id; topic.started = true; save(); }
     const ok = result.subtype === "success" && !result.is_error;
-    const cost = typeof result.total_cost_usd === "number" ? ` · ~$${result.total_cost_usd.toFixed(2)}` : "";
-    await edit(topic, status, `${ok ? "✅" : "⚠️"} ${tag(topic)} xong · ${steps} bước · ${secs}s${cost}`);
+    const u = result.usage || {};
+    const tin = (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0);
+    const tokens = tin || u.output_tokens ? ` · ${fmtTok(tin)} in / ${fmtTok(u.output_tokens || 0)} out` : "";
+    await edit(topic, status, `${ok ? "✅" : "⚠️"} ${tag(topic)} xong · ${steps} bước · ${secs}s${tokens}`);
     await send(topic, result.result || (ok ? "(xong, không có nội dung trả về)" : `⚠️ ${result.subtype}`));
   } else {
     await edit(topic, status, `❌ ${tag(topic)} lỗi (exit ${code}) sau ${secs}s`);
@@ -205,15 +232,19 @@ bot.command("id", (ctx) =>
   }),
 );
 
-// /new                → topic mới, thư mục tự đặt theo tên con vật
-// /new tuni-web       → topic mới, làm việc trong ~/agents/tuni-web (hoặc đường dẫn tuyệt đối)
 bot.command("new", async (ctx) => {
   if (!ctx.chat.is_forum) return ctx.reply("Group cần bật Topics.");
   const { name, emoji } = pickAnimal();
-  const folder = ctx.match?.trim().split(/\s+/)[0] || slug(name);
-  const cwd = path.isAbsolute(expand(folder)) ? expand(folder) : path.join(PROJECTS_ROOT, folder);
+  // /new                  → làm việc ở thư mục home (~), giống mở terminal mới
+  // /new work/robo-worker → ~/work/robo-worker (tương đối tính từ ~, như `cd` trong terminal)
+  // /new /abs/path, ~/x   → đúng đường dẫn đó
+  const folder = ctx.match?.trim().split(/\s+/)[0];
+  const home = os.homedir();
+  const cwd = !folder ? home : path.resolve(home, expand(folder));
+  const existed = fs.existsSync(cwd);
   fs.mkdirSync(cwd, { recursive: true });
-  if (fs.existsSync(TEMPLATE_DIR)) fs.cpSync(TEMPLATE_DIR, cwd, { recursive: true, force: false });
+  // Chỉ copy template vào thư mục MỚI tạo — không đụng vào repo có sẵn hay home
+  if (!existed && fs.existsSync(TEMPLATE_DIR)) fs.cpSync(TEMPLATE_DIR, cwd, { recursive: true });
 
   const ft = await ctx.api.createForumTopic(ctx.chat.id, `${name} ${emoji}`);
   const topic = {
@@ -254,13 +285,37 @@ bot.command("status", async (ctx) => {
   });
 });
 
+// /usage → quota gói Claude (dùng được ở mọi topic, không tốn token)
+bot.command("usage", async (ctx) => {
+  fs.mkdirSync(PROJECTS_ROOT, { recursive: true });
+  const { out } = await runCapture(
+    CLAUDE_BIN, ["-p", "/usage", "--output-format", "json", "--no-session-persistence"], PROJECTS_ROOT, 60000,
+  );
+  let text = out.trim();
+  try { text = JSON.parse(text.slice(text.indexOf("{"))).result || text; } catch {}
+  await ctx.reply(text.slice(0, 4000) || "(không lấy được usage)", {
+    message_thread_id: ctx.message?.message_thread_id,
+  });
+});
+
 // ---------- messages in topics ----------
 bot.on("message", async (ctx) => {
   const topic = db.topics[ctx.message.message_thread_id];
   if (!topic) return; // General or unknown topic
   const text = ctx.message.text ?? ctx.message.caption;
   if (!text) return send(topic, "Bản này mới nhận text. Gửi link Figma/đường dẫn file thay cho ảnh nhé.");
-  if (text.startsWith("/")) return;
+
+  // `!cmd` → chạy shell trực tiếp trong thư mục của topic (như ! trong Claude CLI)
+  if (text.startsWith("!")) {
+    const cmd = text.slice(1).trim();
+    if (!cmd) return;
+    const { code, out } = await runCapture("/bin/zsh", ["-lc", cmd], topic.cwd);
+    return send(topic, `$ ${cmd}\n${out.trim() || "(không có output)"}${code ? `\n[exit ${code}]` : ""}`);
+  }
+
+  // Slash command khác (/context, /compact, ...) → chuyển thẳng cho Claude CLI của session này
+  if (text.startsWith("/")) return enqueue(topic, text.replace(/^(\/\w+)@\w+/, "$1"));
+
   enqueue(topic, text);
 });
 
@@ -280,6 +335,9 @@ await bot.api.setMyCommands([
   { command: "status", description: "Xem các session" },
   { command: "stop", description: "Dừng task trong topic này" },
   { command: "reset", description: "Xoá context, giữ thư mục" },
+  { command: "usage", description: "Xem quota gói Claude" },
+  { command: "context", description: "Xem context của session này" },
+  { command: "compact", description: "Nén context của session này" },
   { command: "id", description: "Xem chat_id / user_id" },
 ]);
 if (CHAT_ID) bot.api.sendMessage(CHAT_ID, "🟢 Agent bot online").catch(() => {});

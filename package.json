@@ -1,0 +1,16 @@
+{
+  "name": "tele-agent-router",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "1 Telegram bot, 1 group with Topics, each topic = 1 Claude Code session (resumed on demand).",
+  "scripts": {
+    "start": "node --env-file=.env index.mjs"
+  },
+  "engines": {
+    "node": ">=20.6"
+  },
+  "dependencies": {
+    "grammy": "^1.46.0"
+  }
+}

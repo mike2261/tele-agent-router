@@ -42,12 +42,13 @@ Group "Agent Team" (Topics)
 | `/reset` | trong topic | Xoá context, giữ nguyên code |
 | `/exit` | trong topic | Dừng task, xoá session và xoá luôn topic (thư mục code giữ nguyên) |
 | `/status` | đâu cũng được | Xem session nào đang chạy / chờ / rảnh |
+| `? câu hỏi` | trong topic | Hỏi nhanh (vd `? tình hình sao rồi`) trên bản sao chỉ đọc của session, trả lời ngay kể cả khi task đang chạy, không ngắt task |
 | `!lệnh` | trong topic | Chạy shell trực tiếp trong thư mục của topic (không qua Claude, không tốn token, không bị allow-list chặn) |
 | `/usage` | đâu cũng được | Xem quota gói Claude |
 | `/chrome` (`on`/`off`) | trong topic | Bật/tắt Claude in Chrome cho topic đó (Chrome thật trên Mac, kèm đăng nhập của bạn) |
 | `/context`, `/compact`, `/...` | trong topic | Chuyển thẳng cho Claude CLI của session đó |
 
-Mỗi task: bot gửi `⏳ đang làm...`, cứ ~4 giây cập nhật bước đang làm (tool nào, file nào), xong thì báo `✅` kèm thời gian và số token (in/out), rồi gửi câu trả lời.
+Mỗi task: bot gửi `⏳ đang làm...`, cứ ~5 giây cập nhật bước đang làm (tool nào, file nào) và các sub-agent đang chạy, xong thì báo `✅` kèm thời gian và số token (in/out), rồi gửi câu trả lời.
 
 ## Ghi chú
 

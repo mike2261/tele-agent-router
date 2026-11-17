@@ -131,9 +131,10 @@ function pump() {
 const fmtTok = (n) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : String(n));
 
 // Run a shell command and collect output (used by `!cmd` and /usage)
-function runCapture(cmd, args, cwd, timeoutMs = 120000) {
+function runCapture(cmd, args, cwd, timeoutMs = 120000, input) {
   return new Promise((resolve) => {
-    const child = spawn(cmd, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(cmd, args, { cwd, env, stdio: [input == null ? "ignore" : "pipe", "pipe", "pipe"] });
+    if (input != null) child.stdin.end(input);
     let out = "";
     const add = (c) => { out += c; if (out.length > 20000) out = out.slice(-20000); };
     child.stdout.on("data", add);
@@ -148,6 +149,40 @@ function describeTool(b) {
   const i = b.input || {};
   const detail = i.command || i.file_path || i.path || i.pattern || i.url || i.description || "";
   return `${b.name}${detail ? ": " + String(detail).replace(/\s+/g, " ").slice(0, 90) : ""}`;
+}
+
+// Hỏi nhanh: fork session hiện tại (chỉ đọc, không lưu) để trả lời ngay cả khi task chính đang chạy
+const SIDE_PROMPT =
+  "Đây là câu hỏi nhanh của người dùng qua Telegram, trong lúc task chính có thể vẫn đang chạy ở tiến trình khác. " +
+  "Bạn là bản sao CHỈ ĐỌC của session: không sửa file, không chạy lệnh làm thay đổi gì, không spawn sub-agent, không tiếp tục làm task. " +
+  "Trả lời ngắn gọn dựa trên lịch sử session và trạng thái file hiện tại (có thể đọc file, git status/log/diff).";
+const SIDE_ALLOW = ["Read", "Grep", "Glob", "Bash(git status:*)", "Bash(git log:*)", "Bash(git diff:*)", "Bash(ls:*)"];
+
+async function askSide(topic, question) {
+  if (!topic.started) return send(topic, "Session chưa chạy lượt nào nên chưa có gì để hỏi.");
+  const t0 = Date.now();
+  const status = await send(topic, `🔎 ${tag(topic)} đang xem (không ngắt task chính)...`);
+  const args = [
+    "-p", "--output-format", "json",
+    "--resume", topic.sessionId, "--fork-session", "--no-session-persistence",
+    "--permission-mode", "plan",
+    "--append-system-prompt", SIDE_PROMPT,
+    "--allowedTools", ...SIDE_ALLOW,
+    "--disallowedTools", "Agent", "Task", "Edit", "Write", "NotebookEdit",
+  ];
+  if (MODEL) args.push("--model", MODEL);
+  const { out } = await runCapture(CLAUDE_BIN, args, topic.cwd, 300000, question);
+  let r;
+  try { r = JSON.parse(out.slice(out.indexOf("{"))); } catch {}
+  const secs = ((Date.now() - t0) / 1000) | 0;
+  if (!r) {
+    await edit(topic, status, `❌ ${tag(topic)} hỏi nhanh lỗi sau ${secs}s`);
+    return send(topic, out.trim().slice(-1500) || "(không có output)");
+  }
+  const u = r.usage || {};
+  const tin = (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0);
+  await edit(topic, status, `🔎 ${tag(topic)} hỏi nhanh · ${secs}s · ${fmtTok(tin)} in / ${fmtTok(u.output_tokens || 0)} out`);
+  await send(topic, r.result || "(không có câu trả lời)");
 }
 
 async function runClaude(topic, prompt) {
@@ -175,12 +210,23 @@ async function runClaude(topic, prompt) {
   if (running.get(topic.threadId).stopped) child.kill("SIGINT"); // /exit lúc đang khởi động
   child.stdin.end(prompt); // prompt via stdin: safe for long text / leading dashes
 
-  let buf = "", stderr = "", result = null, steps = 0, lastTool = "", lastEdit = 0;
-  const tick = () => {
-    if (Date.now() - lastEdit < 4000) return;
-    lastEdit = Date.now();
-    edit(topic, status, `⏳ ${tag(topic)} đang làm... (${steps} bước, ${((Date.now() - t0) / 1000) | 0}s)\n▸ ${lastTool}`);
+  let buf = "", stderr = "", result = null, steps = 0, lastTool = "", lastText = "";
+  const subs = new Map(); // task_id → { desc, toolUseId, lastTool }
+  const render = () => {
+    let t = `⏳ ${tag(topic)} đang làm... (${steps} bước, ${((Date.now() - t0) / 1000) | 0}s)`;
+    if (lastTool) t += `\n▸ ${lastTool}`;
+    if (subs.size) {
+      t += `\n🤖 ${subs.size} sub-agent đang chạy:`;
+      for (const a of subs.values()) t += `\n • ${a.desc}${a.lastTool ? ` — ${a.lastTool}` : ""}`;
+    }
+    return t;
   };
+  // Cập nhật dòng trạng thái mỗi 5s (Telegram giới hạn tốc độ sửa tin nhắn)
+  const timer = setInterval(() => {
+    const t = render();
+    if (t !== lastText) { lastText = t; edit(topic, status, t); }
+  }, 5000);
+  const subByToolUse = (id) => [...subs.values()].find((a) => a.toolUseId === id);
   const handle = (line) => {
     let m;
     try { m = JSON.parse(line); } catch { return; }
@@ -188,9 +234,21 @@ async function runClaude(topic, prompt) {
       topic.started = true;
       if (m.session_id) topic.sessionId = m.session_id;
       save();
+    } else if (m.type === "system" && m.subtype === "task_started") {
+      subs.set(m.task_id, {
+        desc: String(m.description || m.subagent_type || "sub-agent").slice(0, 60),
+        toolUseId: m.tool_use_id, lastTool: "",
+      });
+    } else if (m.type === "system" && (m.subtype === "task_updated" || m.subtype === "task_notification")) {
+      const st = m.patch?.status ?? m.status;
+      if (st && st !== "running" && st !== "pending") subs.delete(m.task_id);
     } else if (m.type === "assistant") {
+      const sub = m.parent_tool_use_id && subByToolUse(m.parent_tool_use_id);
       for (const b of m.message?.content ?? []) {
-        if (b.type === "tool_use") { steps++; lastTool = describeTool(b); tick(); }
+        if (b.type !== "tool_use") continue;
+        steps++;
+        if (sub) sub.lastTool = describeTool(b).slice(0, 60);
+        else lastTool = describeTool(b);
       }
     } else if (m.type === "result") {
       result = m;
@@ -207,6 +265,7 @@ async function runClaude(topic, prompt) {
   });
   child.stderr.on("data", (c) => (stderr = (stderr + c).slice(-2000)));
   const code = await new Promise((res) => child.on("close", res));
+  clearInterval(timer);
   if (buf.trim()) handle(buf.trim());
 
   const secs = ((Date.now() - t0) / 1000) | 0;
@@ -360,6 +419,9 @@ bot.on("message", async (ctx) => {
     const { code, out } = await runCapture("/bin/zsh", ["-lc", cmd], topic.cwd);
     return send(topic, `$ ${cmd}\n${out.trim() || "(không có output)"}${code ? `\n[exit ${code}]` : ""}`);
   }
+
+  // `? câu hỏi` → hỏi nhanh trên bản sao (fork) của session, không chặn task đang chạy
+  if (text.startsWith("?")) return askSide(topic, text.slice(1).trim() || "Tình hình đang thế nào?");
 
   // Slash command khác (/context, /compact, ...) → chuyển thẳng cho Claude CLI của session này
   if (text.startsWith("/")) return enqueue(topic, text.replace(/^(\/\w+)@\w+/, "$1"));

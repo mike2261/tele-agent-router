@@ -37,9 +37,13 @@ Group "Agent Team" (Topics)
 |---|---|---|
 | `/new` | General | Tạo topic + session mới, làm việc ở `~` (home) |
 | `/new work/robo-worker` | General | Tạo topic mới, làm việc trong `~/work/robo-worker` (tương đối tính từ `~`, như `cd`). Thư mục mới tạo thì được copy template; thư mục có sẵn thì giữ nguyên |
+| `/new work/robo-worker Robo Worker` | General | Như trên, đặt tên topic là "Robo Worker" (mặc định lấy tên thư mục) |
 | (nhắn bình thường) | trong topic | Giao việc / chat với session đó |
 | `/stop` | trong topic | Dừng task đang chạy |
 | `/reset` | trong topic | Xoá context, giữ nguyên code |
+| `/resume` (`<id>`) | trong topic | Liệt kê session gần đây trong thư mục topic (kể cả session mở từ terminal) và bấm để chuyển |
+| `/sid` | trong topic | In lệnh `cd … && claude -r <id>` để mở tiếp session trên máy |
+| `/rename Tên mới` | trong topic | Đổi tên topic (đổi tay trên Telegram cũng được, bot tự cập nhật) |
 | `/exit` | trong topic | Dừng task, xoá session và xoá luôn topic (thư mục code giữ nguyên) |
 | `/status` | đâu cũng được | Xem session nào đang chạy / chờ / rảnh |
 | `? câu hỏi` | trong topic | Hỏi nhanh (vd `? tình hình sao rồi`) trên bản sao chỉ đọc của session, trả lời ngay kể cả khi task đang chạy, không ngắt task |

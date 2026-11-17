@@ -28,7 +28,15 @@ const DB_FILE = expand(env.DB_FILE || path.resolve("sessions.json"));
 const APPEND_PROMPT =
   env.APPEND_PROMPT ||
   "Người dùng nhắn cho bạn qua Telegram, tin nhắn của họ được chuyển thẳng vào đây. " +
-    "Trả lời tự nhiên như đang làm việc trong terminal, dùng ngôn ngữ người dùng dùng. Không cần tóm tắt theo mẫu cố định.";
+    "Trả lời tự nhiên như đang làm việc trong terminal, dùng ngôn ngữ người dùng dùng. Không cần tóm tắt theo mẫu cố định. " +
+    "Khi cần chạy tiến trình chạy mãi (dev server, Metro/expo start, vite dev, emulator...), KHÔNG dùng background task " +
+    "của Bash tool vì lượt trả lời sẽ không kết thúc được; hãy tách hẳn: `nohup <lệnh> > /tmp/<tên>.log 2>&1 &` rồi đọc log khi cần.";
+
+// Plugin tắt riêng cho bot (Claude CLI trên máy vẫn giữ nguyên). Phẩy ngăn cách, dạng name@marketplace.
+const DISABLED_PLUGINS = (env.DISABLED_PLUGINS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+const SETTINGS_ARGS = DISABLED_PLUGINS.length
+  ? ["--settings", JSON.stringify({ enabledPlugins: Object.fromEntries(DISABLED_PLUGINS.map((p) => [p, false])) })]
+  : [];
 
 let TEMPLATE_ALLOW = [];
 try {
@@ -96,6 +104,19 @@ async function edit(topic, msg, text) {
 
 // ---------- run queue ----------
 const running = new Map(); // threadId -> { child, stopped }
+// Tiến trình claude đã trả kết quả nhưng chưa thoát vì còn tác vụ nền (vd dev server Metro)
+const lingering = new Map(); // threadId -> child
+async function killLingering(threadId) {
+  const child = lingering.get(threadId);
+  if (!child) return false;
+  lingering.delete(threadId);
+  const closed = new Promise((r) => child.once("close", r));
+  child.kill("SIGINT");
+  const t = setTimeout(() => child.exitCode === null && child.kill("SIGKILL"), 5000);
+  await Promise.race([closed, new Promise((r) => setTimeout(r, 6000))]);
+  clearTimeout(t);
+  return true;
+}
 const queues = new Map(); // threadId -> [prompt]
 const waiting = []; // threadIds waiting for a slot
 
@@ -169,6 +190,7 @@ async function askSide(topic, question) {
     "--append-system-prompt", SIDE_PROMPT,
     "--allowedTools", ...SIDE_ALLOW,
     "--disallowedTools", "Agent", "Task", "Edit", "Write", "NotebookEdit",
+    ...SETTINGS_ARGS,
   ];
   if (MODEL) args.push("--model", MODEL);
   const { out } = await runCapture(CLAUDE_BIN, args, topic.cwd, 300000, question);
@@ -192,6 +214,7 @@ async function runClaude(topic, prompt) {
     "--verbose",
     "--permission-mode", PERMISSION_MODE,
     "--append-system-prompt", APPEND_PROMPT,
+    ...SETTINGS_ARGS,
   ];
   if (topic.started) args.push("--resume", topic.sessionId);
   else args.push("--session-id", topic.sessionId);
@@ -203,6 +226,10 @@ async function runClaude(topic, prompt) {
   if (topic.chrome) { args.push("--chrome"); allow.push("mcp__claude-in-chrome"); }
   if (allow.length) args.push("--allowedTools", ...allow);
 
+  // Phiên trước còn treo vì tác vụ nền → dừng nó trước, tránh 2 tiến trình cùng ghi 1 session
+  if (await killLingering(topic.threadId))
+    await send(topic, "⏹ Đã dừng tác vụ nền của lượt trước (vd dev server) để chạy lượt mới.");
+
   const t0 = Date.now();
   const status = await send(topic, `⏳ ${tag(topic)} đang làm...`);
   const child = spawn(CLAUDE_BIN, args, { cwd: topic.cwd, env, stdio: ["pipe", "pipe", "pipe"] });
@@ -210,7 +237,7 @@ async function runClaude(topic, prompt) {
   if (running.get(topic.threadId).stopped) child.kill("SIGINT"); // /exit lúc đang khởi động
   child.stdin.end(prompt); // prompt via stdin: safe for long text / leading dashes
 
-  let buf = "", stderr = "", result = null, steps = 0, lastTool = "", lastText = "";
+  let buf = "", stderr = "", steps = 0, lastTool = "", lastText = "";
   const subs = new Map(); // task_id → { desc, toolUseId, lastTool }
   const render = () => {
     let t = `⏳ ${tag(topic)} đang làm... (${steps} bước, ${((Date.now() - t0) / 1000) | 0}s)`;
@@ -251,7 +278,39 @@ async function runClaude(topic, prompt) {
         else lastTool = describeTool(b);
       }
     } else if (m.type === "result") {
-      result = m;
+      if (!finished) finish(m);
+      // Kết quả sau đó = Claude tự chạy tiếp khi tác vụ nền xong → gửi như tin báo thêm
+      else if (m.result) send(topic, `🔔 ${tag(topic)} (sau khi tác vụ nền xong)\n${m.result}`);
+    }
+  };
+  // Claude CLI gửi `result` ngay khi xong lượt, nhưng KHÔNG thoát khi còn tác vụ nền (dev server...).
+  // Nên báo kết quả & nhả slot ngay khi có result; tiến trình còn sống thì giữ ở `lingering`.
+  let finished = false, resolveDone;
+  const done = new Promise((r) => (resolveDone = r));
+  const finish = async (result, code) => {
+    if (finished) return;
+    finished = true;
+    clearInterval(timer);
+    const secs = ((Date.now() - t0) / 1000) | 0;
+    try {
+      if (running.get(topic.threadId)?.stopped) {
+        await edit(topic, status, `🛑 ${tag(topic)} đã dừng sau ${steps} bước.`);
+      } else if (result) {
+        if (result.session_id) { topic.sessionId = result.session_id; topic.started = true; save(); }
+        const ok = result.subtype === "success" && !result.is_error;
+        const u = result.usage || {};
+        const tin = (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0);
+        const tokens = tin || u.output_tokens ? ` · ${fmtTok(tin)} in / ${fmtTok(u.output_tokens || 0)} out` : "";
+        const bg = child.exitCode === null ? "\n⚙️ còn tác vụ nền đang chạy (dev server...). /stop để tắt." : "";
+        if (child.exitCode === null) lingering.set(topic.threadId, child);
+        await edit(topic, status, `${ok ? "✅" : "⚠️"} ${tag(topic)} xong · ${steps} bước · ${secs}s${tokens}${bg}`);
+        await send(topic, result.result || (ok ? "(xong, không có nội dung trả về)" : `⚠️ ${result.subtype}`));
+      } else {
+        await edit(topic, status, `❌ ${tag(topic)} lỗi (exit ${code}) sau ${secs}s`);
+        await send(topic, `stderr:\n${stderr || "(trống)"}`);
+      }
+    } finally {
+      resolveDone();
     }
   };
   child.stdout.on("data", (chunk) => {
@@ -264,27 +323,12 @@ async function runClaude(topic, prompt) {
     }
   });
   child.stderr.on("data", (c) => (stderr = (stderr + c).slice(-2000)));
-  const code = await new Promise((res) => child.on("close", res));
-  clearInterval(timer);
-  if (buf.trim()) handle(buf.trim());
-
-  const secs = ((Date.now() - t0) / 1000) | 0;
-  if (running.get(topic.threadId)?.stopped) {
-    await edit(topic, status, `🛑 ${tag(topic)} đã dừng sau ${steps} bước.`);
-    return;
-  }
-  if (result) {
-    if (result.session_id) { topic.sessionId = result.session_id; topic.started = true; save(); }
-    const ok = result.subtype === "success" && !result.is_error;
-    const u = result.usage || {};
-    const tin = (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0);
-    const tokens = tin || u.output_tokens ? ` · ${fmtTok(tin)} in / ${fmtTok(u.output_tokens || 0)} out` : "";
-    await edit(topic, status, `${ok ? "✅" : "⚠️"} ${tag(topic)} xong · ${steps} bước · ${secs}s${tokens}`);
-    await send(topic, result.result || (ok ? "(xong, không có nội dung trả về)" : `⚠️ ${result.subtype}`));
-  } else {
-    await edit(topic, status, `❌ ${tag(topic)} lỗi (exit ${code}) sau ${secs}s`);
-    await send(topic, `stderr:\n${stderr || "(trống)"}`);
-  }
+  child.on("close", (code) => {
+    if (buf.trim()) handle(buf.trim());
+    if (lingering.get(topic.threadId) === child) lingering.delete(topic.threadId);
+    finish(null, code);
+  });
+  await done;
 }
 
 // ---------- auth ----------
@@ -307,7 +351,8 @@ bot.command("new", async (ctx) => {
   // /new                  → làm việc ở thư mục home (~), giống mở terminal mới
   // /new work/robo-worker → ~/work/robo-worker (tương đối tính từ ~, như `cd` trong terminal)
   // /new /abs/path, ~/x   → đúng đường dẫn đó
-  const folder = ctx.match?.trim().split(/\s+/)[0];
+  // /new work/robo-worker Robo Worker → như trên, đặt tên topic là "Robo Worker"
+  const [folder, ...nameWords] = ctx.match?.trim().split(/\s+/).filter(Boolean) ?? [];
   const home = os.homedir();
   const cwd = !folder ? home : path.resolve(home, expand(folder));
   const existed = fs.existsSync(cwd);
@@ -315,7 +360,9 @@ bot.command("new", async (ctx) => {
   // Chỉ copy template vào thư mục MỚI tạo — không đụng vào repo có sẵn hay home
   if (!existed && fs.existsSync(TEMPLATE_DIR)) fs.cpSync(TEMPLATE_DIR, cwd, { recursive: true });
 
-  const { name, emoji } = pickName(cwd);
+  const picked = pickName(cwd);
+  const emoji = picked.emoji;
+  const name = nameWords.join(" ").slice(0, 100) || picked.name;
   const ft = await ctx.api.createForumTopic(ctx.chat.id, `${emoji} ${name}`.slice(0, 128));
   const topic = {
     chatId: ctx.chat.id, threadId: ft.message_thread_id, name, emoji, cwd,
@@ -326,14 +373,140 @@ bot.command("new", async (ctx) => {
   await send(topic, `${emoji} ${name} sẵn sàng ${tag(topic)}\n📁 ${cwd}\nNhắn brief vào topic này để bắt đầu.`);
 });
 
+// /rename Tên mới → đổi tên topic (giữ emoji)
+bot.command("rename", async (ctx) => {
+  const topic = db.topics[ctx.message?.message_thread_id];
+  if (!topic) return ctx.reply("Gõ /rename trong một topic.");
+  const name = ctx.match?.trim().slice(0, 100);
+  if (!name) return send(topic, "Gõ: /rename Tên mới");
+  try {
+    await bot.api.editForumTopic(topic.chatId, topic.threadId, { name: `${topic.emoji} ${name}`.slice(0, 128) });
+  } catch (e) {
+    return send(topic, `Không đổi được tên topic (${e.description || e.message}). Bot cần quyền Manage Topics.`);
+  }
+  topic.name = name;
+  save();
+});
+
+// Đổi tên topic bằng tay trên Telegram → cập nhật tên trong bot
+bot.on("message:forum_topic_edited", async (ctx) => {
+  const topic = db.topics[ctx.message.message_thread_id];
+  const raw = ctx.message.forum_topic_edited.name;
+  if (!topic || !raw) return;
+  topic.name = raw.startsWith(topic.emoji) ? raw.slice(topic.emoji.length).trim() || raw : raw;
+  save();
+});
+
 bot.command("stop", async (ctx) => {
   const id = ctx.message?.message_thread_id;
   const r = running.get(id);
   queues.delete(id);
-  if (!r?.child) return ctx.reply("Không có task nào đang chạy.", { message_thread_id: id });
+  if (!r?.child) {
+    const killed = await killLingering(id);
+    return ctx.reply(killed ? "⏹ Đã tắt tác vụ nền (dev server...) của topic này." : "Không có task nào đang chạy.",
+      { message_thread_id: id });
+  }
   r.stopped = true;
   r.child.kill("SIGINT");
   setTimeout(() => r.child.exitCode === null && r.child.kill("SIGKILL"), 5000);
+});
+
+// ---------- /resume, /sid: nối session giữa Telegram và Claude CLI trên máy ----------
+// Claude lưu session ở ~/.claude/projects/<cwd, ký tự lạ → "-">/<sessionId>.jsonl
+const sessionDir = (cwd) => path.join(os.homedir(), ".claude", "projects", cwd.replace(/[^a-zA-Z0-9]/g, "-"));
+const ago = (ms) => {
+  const m = Math.round((Date.now() - ms) / 60000);
+  return m < 60 ? `${m} phút trước` : m < 1440 ? `${Math.round(m / 60)} giờ trước` : `${Math.round(m / 1440)} ngày trước`;
+};
+function firstPrompt(file) {
+  // Chỉ đọc 256KB đầu: file session có thể vài chục MB
+  let text = "";
+  try {
+    const fd = fs.openSync(file, "r");
+    const b = Buffer.alloc(262144);
+    text = b.subarray(0, fs.readSync(fd, b, 0, b.length, 0)).toString("utf8");
+    fs.closeSync(fd);
+  } catch { return ""; }
+  for (const line of text.split("\n")) {
+    let m;
+    try { m = JSON.parse(line); } catch { continue; }
+    if (m.type !== "user" || m.isMeta) continue;
+    const c = m.message?.content;
+    const t = typeof c === "string" ? c : Array.isArray(c) ? c.find((x) => x.type === "text")?.text ?? "" : "";
+    if (t && !t.startsWith("<")) return t.replace(/\s+/g, " ").trim();
+  }
+  return "";
+}
+function listSessions(cwd, limit = 8) {
+  const dir = sessionDir(cwd);
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir)
+    .filter((f) => f.endsWith(".jsonl"))
+    .map((f) => ({ id: f.slice(0, -6), file: path.join(dir, f), mtime: fs.statSync(path.join(dir, f)).mtimeMs }))
+    .sort((a, b) => b.mtime - a.mtime)
+    .slice(0, limit)
+    .map((x) => ({ ...x, prompt: firstPrompt(x.file) }));
+}
+const shq = (p) => `'${p.replace(/'/g, `'\\''`)}'`;
+
+async function switchSession(topic, id) {
+  if (running.has(topic.threadId)) return "Topic đang chạy task. /stop trước rồi /resume.";
+  if (!fs.existsSync(path.join(sessionDir(topic.cwd), `${id}.jsonl`))) return `Không thấy session ${id} trong ${topic.cwd}.`;
+  await killLingering(topic.threadId);
+  queues.delete(topic.threadId);
+  topic.sessionId = id;
+  topic.started = true;
+  save();
+  return null;
+}
+
+// /resume           → liệt kê session gần đây trong thư mục topic (kể cả session mở từ terminal), bấm để chọn
+// /resume <id|8 ký tự đầu> → chuyển thẳng
+bot.command("resume", async (ctx) => {
+  const id = ctx.message?.message_thread_id;
+  const topic = db.topics[id];
+  if (!topic) return ctx.reply("Gõ /resume trong một topic.");
+  const sessions = listSessions(topic.cwd, 30);
+  const arg = ctx.match?.trim();
+  if (arg) {
+    const hit = sessions.filter((x) => x.id.startsWith(arg));
+    if (hit.length !== 1) return send(topic, hit.length ? "Trùng nhiều session, gõ dài hơn." : `Không thấy session bắt đầu bằng ${arg}.`);
+    const err = await switchSession(topic, hit[0].id);
+    return send(topic, err || `↩️ Đã chuyển sang session ${tag(topic)}\n${hit[0].prompt.slice(0, 200)}`);
+  }
+  const top = sessions.slice(0, 8);
+  if (!top.length) return send(topic, `Chưa có session nào trong ${topic.cwd}.`);
+  const lines = top.map((x, i) =>
+    `${i + 1}. #${x.id.slice(0, 8)}${x.id === topic.sessionId ? " (đang dùng)" : ""} · ${ago(x.mtime)}\n   ${x.prompt.slice(0, 80) || "(trống)"}`);
+  await ctx.reply(`Session trong ${topic.cwd}:\n\n${lines.join("\n")}\n\nBấm để chuyển:`, {
+    message_thread_id: id,
+    reply_markup: {
+      inline_keyboard: top.map((x, i) => [{
+        text: `${i + 1}. #${x.id.slice(0, 8)} · ${ago(x.mtime)}${x.id === topic.sessionId ? " ✓" : ""}`,
+        callback_data: `resume:${x.id}`,
+      }]),
+    },
+  });
+});
+
+bot.callbackQuery(/^resume:(.+)$/, async (ctx) => {
+  const topic = db.topics[ctx.callbackQuery.message?.message_thread_id];
+  if (!topic) return ctx.answerCallbackQuery({ text: "Topic không còn." });
+  const err = await switchSession(topic, ctx.match[1]);
+  await ctx.answerCallbackQuery({ text: err || "Đã chuyển session" });
+  if (!err) {
+    await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }).catch(() => {});
+    await send(topic, `↩️ Đã chuyển sang session ${tag(topic)}. Nhắn tiếp như bình thường.\n` +
+      "Nếu session này đang mở trong terminal, thoát terminal trước để tránh 2 bên cùng ghi.");
+  }
+});
+
+// /sid → lệnh để mở tiếp session này trên máy bằng Claude CLI
+bot.command("sid", async (ctx) => {
+  const topic = db.topics[ctx.message?.message_thread_id];
+  if (!topic) return ctx.reply("Gõ /sid trong một topic.");
+  await send(topic, `cd ${shq(topic.cwd)} && claude -r ${topic.sessionId}\n\n` +
+    "Đừng chạy cùng lúc với bot. Làm xong trên terminal thì thoát, quay lại đây nhắn tiếp.");
 });
 
 // /exit → dừng task, xoá session khỏi bot và xoá luôn topic (thư mục code giữ nguyên)
@@ -350,6 +523,7 @@ bot.command("exit", async (ctx) => {
     r.child.kill("SIGINT");
     setTimeout(() => r.child.exitCode === null && r.child.kill("SIGKILL"), 5000);
   }
+  killLingering(id);
   delete db.topics[id];
   save();
   try {
@@ -410,6 +584,7 @@ bot.on("message", async (ctx) => {
   const topic = db.topics[ctx.message.message_thread_id];
   if (!topic) return; // General or unknown topic
   const text = ctx.message.text ?? ctx.message.caption;
+  if (!text && !(ctx.message.photo || ctx.message.document || ctx.message.voice || ctx.message.video || ctx.message.sticker)) return; // tin hệ thống
   if (!text) return send(topic, "Bản này mới nhận text. Gửi link Figma/đường dẫn file thay cho ảnh nhé.");
 
   // `!cmd` → chạy shell trực tiếp trong thư mục của topic (như ! trong Claude CLI)
@@ -434,6 +609,7 @@ bot.catch((err) => console.error("bot error:", err.error ?? err));
 // ---------- lifecycle ----------
 const shutdown = async () => {
   for (const r of running.values()) r.child?.kill("SIGINT");
+  for (const c of lingering.values()) c.kill("SIGINT");
   await bot.stop();
   process.exit(0);
 };
@@ -448,6 +624,9 @@ await bot.api.setMyCommands([
   { command: "usage", description: "Xem quota gói Claude" },
   { command: "chrome", description: "Bật/tắt Claude in Chrome cho topic này" },
   { command: "exit", description: "Đóng session và xoá topic này" },
+  { command: "rename", description: "Đổi tên topic này" },
+  { command: "resume", description: "Chọn session khác (kể cả mở từ terminal)" },
+  { command: "sid", description: "Lệnh claude -r để mở session này trên máy" },
   { command: "context", description: "Xem context của session này" },
   { command: "compact", description: "Nén context của session này" },
   { command: "id", description: "Xem chat_id / user_id" },

@@ -43,6 +43,7 @@ Group "Agent Team" (Topics)
 | `/reset` | trong topic | Xoá context, giữ nguyên code |
 | `/resume` (`<id>`) | trong topic | Liệt kê session gần đây trong thư mục topic (kể cả session mở từ terminal) và bấm để chuyển |
 | `/sid` | trong topic | In lệnh `cd … && claude -r <id>` để mở tiếp session trên máy |
+| `/mode` (`auto`/`accept`/`bypass`/`plan`) | trong topic | Đổi chế độ quyền riêng cho topic |
 | `/rename Tên mới` | trong topic | Đổi tên topic (đổi tay trên Telegram cũng được, bot tự cập nhật) |
 | `/exit` | trong topic | Dừng task, xoá session và xoá luôn topic (thư mục code giữ nguyên) |
 | `/status` | đâu cũng được | Xem session nào đang chạy / chờ / rảnh |
@@ -56,7 +57,7 @@ Mỗi task: bot gửi `⏳ đang làm...`, cứ ~5 giây cập nhật bước đ
 
 ## Ghi chú
 
-- **Quyền:** chạy với `acceptEdits`: agent được sửa file, còn lệnh shell chỉ chạy nếu nằm trong allow-list ở `template/.claude/settings.json` (file này được copy vào mỗi project mới). Lệnh không có trong list bị từ chối, agent sẽ báo lại chứ không bị treo. **Đừng** đổi sang `bypassPermissions`.
+- **Quyền:** mặc định `auto`: agent tự sửa file và chạy lệnh, có bộ lọc của Claude Code chặn lệnh nguy hiểm, nên session mở từ terminal rồi `/resume` sang Telegram vẫn chạy được lệnh như cũ. `acceptEdits` thì chỉ chạy lệnh trong allow-list ở `template/.claude/settings.json`, lệnh khác bị từ chối vì không có ai bấm duyệt. Đổi riêng từng topic bằng `/mode`. Chỉ dùng `/mode bypass` khi thật cần: nó chạy mọi lệnh không kiểm tra.
 - **Quota:** mọi session dùng chung gói Claude. `MAX_CONCURRENT=2` là đủ; task thừa sẽ tự xếp hàng.
 - **Mac tắt hoặc mất mạng:** Telegram giữ tin chưa đọc tối đa 24h. Router bật lại sẽ xử lý tiếp.
 - **`template/CLAUDE.md`:** sửa thành quy tắc / stack mặc định của bạn để agent ít phải hỏi.

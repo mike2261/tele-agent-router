@@ -212,7 +212,7 @@ async function runClaude(topic, prompt) {
     "-p",
     "--output-format", "stream-json",
     "--verbose",
-    "--permission-mode", PERMISSION_MODE,
+    "--permission-mode", topic.mode || PERMISSION_MODE,
     "--append-system-prompt", APPEND_PROMPT,
     ...SETTINGS_ARGS,
   ];
@@ -374,6 +374,28 @@ bot.command("new", async (ctx) => {
 });
 
 // /rename Tên mới → đổi tên topic (giữ emoji)
+// /mode [auto|acceptEdits|bypassPermissions|plan] → chế độ quyền riêng cho topic này
+const MODES = { auto: "auto", accept: "acceptEdits", acceptedits: "acceptEdits", bypass: "bypassPermissions",
+  bypasspermissions: "bypassPermissions", plan: "plan", default: null };
+bot.command("mode", async (ctx) => {
+  const topic = db.topics[ctx.message?.message_thread_id];
+  if (!topic) return ctx.reply("Gõ /mode trong một topic.");
+  const arg = ctx.match?.trim().toLowerCase();
+  if (!arg) {
+    return send(topic, `Chế độ quyền: ${topic.mode || PERMISSION_MODE}${topic.mode ? "" : " (mặc định)"}\n` +
+      "/mode auto: tự chạy lệnh, có bộ lọc chặn lệnh nguy hiểm (khuyên dùng)\n" +
+      "/mode accept: chỉ chạy lệnh trong allow-list\n" +
+      "/mode bypass: chạy MỌI lệnh, không kiểm tra\n" +
+      "/mode plan: chỉ đọc, lên kế hoạch\n" +
+      "/mode default: về mặc định trong .env");
+  }
+  if (!(arg in MODES)) return send(topic, "Không có chế độ đó. Gõ /mode để xem danh sách.");
+  topic.mode = MODES[arg] || undefined;
+  save();
+  const m = topic.mode || PERMISSION_MODE;
+  await send(topic, `🔐 Chế độ quyền: ${m}${m === "bypassPermissions" ? "\n⚠️ Claude sẽ chạy mọi lệnh mà không kiểm tra." : ""}\nÁp dụng từ lượt tiếp theo.`);
+});
+
 bot.command("rename", async (ctx) => {
   const topic = db.topics[ctx.message?.message_thread_id];
   if (!topic) return ctx.reply("Gõ /rename trong một topic.");
@@ -625,6 +647,7 @@ await bot.api.setMyCommands([
   { command: "chrome", description: "Bật/tắt Claude in Chrome cho topic này" },
   { command: "exit", description: "Đóng session và xoá topic này" },
   { command: "rename", description: "Đổi tên topic này" },
+  { command: "mode", description: "Chế độ quyền của topic (auto/accept/bypass/plan)" },
   { command: "resume", description: "Chọn session khác (kể cả mở từ terminal)" },
   { command: "sid", description: "Lệnh claude -r để mở session này trên máy" },
   { command: "context", description: "Xem context của session này" },
